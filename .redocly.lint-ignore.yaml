@@ -1,0 +1,22 @@
+# Explicitly ignored lint problems.
+#
+# Each entry is a decision, not a suppression:
+#
+#   no-server-example.com, #/servers/1/url
+#       The second server is http://localhost:8081, for running the service on a
+#       workstation. It is not a production host and is not meant to be one.
+#
+#   operation-4xx-response on /healthz, /readyz and /version
+#       These three are unauthenticated by design and cannot answer 4XX: they
+#       report process and schema state, so their failure mode is 503, not 400.
+#       Documenting an invented 401 on a liveness probe would be worse than
+#       saying here that it has none.
+#
+# Anything else that wants to be added to this file should be fixed instead.
+openapi/bbs-api.yaml:
+  no-server-example.com:
+    - '#/servers/1/url'
+  operation-4xx-response:
+    - '#/paths/~1healthz/get/responses'
+    - '#/paths/~1readyz/get/responses'
+    - '#/paths/~1version/get/responses'

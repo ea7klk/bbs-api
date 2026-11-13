@@ -1,0 +1,123 @@
+name: Validate design
+
+# This repository is a design, so the only thing CI can enforce is that the design
+# is internally consistent: the contract parses and lints, and the documents do
+# not point at files that are not there.
+#
+# When implementation begins, the Go build, tests and contract tests join this
+# workflow — the contract tests are what stop the spec and the handlers drifting.
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  docs:
+    name: Contract and documents
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install PyYAML
+        run: pip install --quiet pyyaml
+
+      - name: Every YAML file parses
+        run: |
+          python3 - <<'PY'
+          import os, sys, yaml
+          # os.walk, not glob: glob skips dot-directories, and .github is one.
+          failed = False
+          for dirpath, dirnames, files in os.walk("."):
+              dirnames[:] = [d for d in dirnames if d != ".git"]
+              for name in files:
+                  if not name.endswith((".yaml", ".yml")):
+                      continue
+                  path = os.path.join(dirpath, name)
+                  try:
+                      with open(path, encoding="utf-8") as fh:
+                          list(yaml.safe_load_all(fh))
+                  except Exception as exc:
+                      print(f"::error file={path}::{exc}")
+                      failed = True
+          sys.exit(1 if failed else 0)
+          PY
+
+      - name: Contract is well formed
+        run: |
+          python3 - <<'PY'
+          import sys, yaml
+          spec = yaml.safe_load(open("openapi/bbs-api.yaml", encoding="utf-8"))
+          problems = []
+          if not str(spec.get("openapi", "")).startswith("3.1"):
+              problems.append("openapi must be 3.1.x")
+          for path, item in spec.get("paths", {}).items():
+              for method, op in item.items():
+                  if method not in ("get", "post", "put", "patch", "delete"):
+                      continue
+                  for field in ("operationId", "summary", "tags"):
+                      if field not in op:
+                          problems.append(f"{method.upper()} {path}: missing {field}")
+          ids = [op["operationId"] for item in spec["paths"].values()
+                 for m, op in item.items() if m in ("get", "post", "put", "patch", "delete")]
+          dupes = {i for i in ids if ids.count(i) > 1}
+          if dupes:
+              problems.append(f"duplicate operationIds: {sorted(dupes)}")
+          for p in problems:
+              print(f"::error::{p}")
+          sys.exit(1 if problems else 0)
+          PY
+
+      - name: Every $ref resolves
+        run: |
+          python3 - <<'PY'
+          import re, sys, yaml
+          spec = yaml.safe_load(open("openapi/bbs-api.yaml", encoding="utf-8"))
+          raw = open("openapi/bbs-api.yaml", encoding="utf-8").read()
+          missing = []
+          for ref in sorted(set(re.findall(r'\$ref: "#/components/([^"]+)"', raw))):
+              node = spec["components"]
+              for part in ref.split("/"):
+                  node = node.get(part) if isinstance(node, dict) else None
+                  if node is None:
+                      missing.append(ref)
+                      break
+          for ref in missing:
+              print(f"::error::unresolved $ref components/{ref}")
+          sys.exit(1 if missing else 0)
+          PY
+
+      - name: Relative links in documents resolve
+        run: |
+          python3 - <<'PY'
+          import os, re, sys
+          broken = []
+          for dirpath, dirnames, files in os.walk("."):
+              dirnames[:] = [d for d in dirnames if d != ".git"]
+              for name in files:
+                  if not name.endswith(".md"):
+                      continue
+                  path = os.path.join(dirpath, name)
+                  text = open(path, encoding="utf-8").read()
+                  for match in re.finditer(r"\]\((?!https?:|#)([^)#]+)(#[^)]*)?\)", text):
+                      target = os.path.normpath(os.path.join(dirpath, match.group(1)))
+                      if not os.path.exists(target):
+                          broken.append(f"{path} -> {match.group(1)}")
+          for b in broken:
+              print(f"::error::{b}")
+          sys.exit(1 if broken else 0)
+          PY
+
+      - name: Lint the contract
+        run: npx --yes @redocly/cli@latest lint openapi/bbs-api.yaml --config .redocly.yaml

@@ -1,0 +1,1431 @@
+openapi: 3.1.0
+
+info:
+  title: HAMNET Radio BBS API
+  version: 1.0.0-design
+  summary: REST API over the HAMNET Radio BBS.
+  description: |
+    A REST interface to the BBS described by `ea7klk/simple-ham-bbs`.
+
+    **Status: design.** This document is the contract the implementation will be
+    written against. It is checked in before the code, and CI fails when the two
+    disagree.
+
+    The classic SSH BBS remains canonical: where this API and the terminal
+    disagree, the terminal is right, and a rule change lands there first.
+
+    Two things this API deliberately does not do: it does not acknowledge APRS
+    messages (the receiver does, for every account), and it does not receive
+    them.
+  license:
+    name: MIT
+    identifier: MIT
+
+servers:
+  - url: https://bbs.ea7klk.es/api
+    description: Production
+  - url: http://localhost:8081
+    description: Local
+
+security:
+  - bearerAuth: []
+
+tags:
+  - name: Sessions
+    description: Logging in, and who you are.
+  - name: Accounts
+    description: Registration, activation, password reset, email change.
+  - name: Directory
+    description: The station directory.
+  - name: Boards
+    description: Boards and threaded messages.
+  - name: Bulletins
+    description: Local bulletins written by the sysop.
+  - name: APRS
+    description: Messaging, history, and the two bots.
+  - name: APRSBulletins
+    description: Bulletins received over APRS. Read-only.
+  - name: Sysop
+    description: Administrative operations. Requires the `bbs.admin` scope.
+  - name: Meta
+    description: Metadata and health.
+
+paths:
+  /healthz:
+    get:
+      operationId: health
+      summary: Process is alive
+      tags: [Meta]
+      security: []
+      responses:
+        "200":
+          description: Alive
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: {type: string, const: ok}
+
+  /readyz:
+    get:
+      operationId: ready
+      summary: Ready to serve
+      description: |
+        The database is open and the schema version is current. APRS-IS is
+        deliberately not consulted: reception is another pod's responsibility.
+      tags: [Meta]
+      security: []
+      responses:
+        "200":
+          description: Ready
+        "503":
+          description: Not ready
+          content:
+            application/problem+json:
+              schema: {$ref: "#/components/schemas/Problem"}
+
+  /version:
+    get:
+      operationId: version
+      summary: Build and schema versions
+      tags: [Meta]
+      security: []
+      responses:
+        "200":
+          description: Version
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [build, commit, schema_version]
+                properties:
+                  build: {type: string}
+                  commit: {type: string}
+                  schema_version: {type: string}
+
+  /about:
+    get:
+      operationId: about
+      summary: BBS identity
+      tags: [Meta]
+      responses:
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "200":
+          description: Identity
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  name: {type: string, examples: [HAMNET RADIO BBS]}
+                  location: {type: string}
+                  topic: {type: string}
+                  ssh_command: {type: string, examples: ["ssh -p 2222 bbs@bbs.ea7klk.es"]}
+
+  /sessions:
+    post:
+      operationId: createSession
+      summary: Log in
+      description: |
+        Exchanges a callsign and password for a bearer token.
+
+        Throttled at five failures per fifteen minutes per account and source
+        address; a lockout returns 429 with `Retry-After`. An unknown account and
+        a wrong password are both 401 with the same body: the terminal does not
+        reveal which, and neither does this.
+      tags: [Sessions]
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [callsign, password]
+              properties:
+                callsign: {type: string, examples: [EA7KLK]}
+                password: {type: string, format: password}
+      responses:
+        "201":
+          description: Authenticated
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Session"}
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          description: Account disabled or not activated
+          content:
+            application/problem+json:
+              schema: {$ref: "#/components/schemas/Problem"}
+        "429":
+          $ref: "#/components/responses/RateLimited"
+
+  /sessions/current:
+    get:
+      operationId: getSession
+      summary: Who am I
+      tags: [Sessions]
+      responses:
+        "200":
+          description: Current session
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Session"}
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+    delete:
+      operationId: deleteSession
+      summary: Log out
+      description: Revokes the token used for the request.
+      tags: [Sessions]
+      responses:
+        "204":
+          description: Revoked
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /accounts:
+    post:
+      operationId: createAccount
+      summary: Register
+      description: |
+        Creates an account. With SMTP configured the account starts inactive and
+        an activation code is mailed; without it the account is active
+        immediately, as on the terminal.
+
+        Throttled at five accounts per hour per source address.
+      tags: [Accounts]
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [callsign, full_name, email, password]
+              properties:
+                callsign: {type: string}
+                full_name: {type: string}
+                email: {type: string, format: email}
+                maidenhead: {type: string}
+                qth: {type: string}
+                rig: {type: string}
+                language: {type: string, enum: [en, de, es, fr]}
+                enable_aprs: {type: boolean, default: false}
+                password: {type: string, format: password, minLength: 8}
+      responses:
+        "201":
+          description: Created
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Account"}
+        "409":
+          description: Callsign already registered
+          content:
+            application/problem+json:
+              schema: {$ref: "#/components/schemas/Problem"}
+        "422":
+          $ref: "#/components/responses/Unprocessable"
+        "429":
+          $ref: "#/components/responses/RateLimited"
+
+  /accounts/activation-codes:
+    post:
+      operationId: sendActivationCode
+      summary: (Re)send the activation code
+      tags: [Accounts]
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [callsign]
+              properties:
+                callsign: {type: string}
+      responses:
+        "202":
+          description: Code sent, if the account needs one
+        "429":
+          $ref: "#/components/responses/RateLimited"
+
+  /accounts/activation:
+    post:
+      operationId: activateAccount
+      summary: Verify the activation code
+      tags: [Accounts]
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [callsign, code]
+              properties:
+                callsign: {type: string}
+                code:
+                  type: string
+                  minLength: 4
+                  maxLength: 4
+                  description: Four characters, from A-Z and 2-9. Case-insensitive.
+      responses:
+        "200":
+          description: Activated
+        "422":
+          description: Wrong, expired, or exhausted code
+          content:
+            application/problem+json:
+              schema: {$ref: "#/components/schemas/Problem"}
+
+  /password-resets:
+    post:
+      operationId: requestPasswordReset
+      summary: Request a reset link
+      description: |
+        Always 202, whether or not the account exists — the alternative is an
+        account enumeration oracle. Capped at three mails per account per hour.
+      tags: [Accounts]
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [identifier]
+              properties:
+                identifier:
+                  type: string
+                  description: Callsign or email address.
+      responses:
+        "202":
+          description: Accepted
+        "429":
+          $ref: "#/components/responses/RateLimited"
+
+  /password-resets/{token}:
+    put:
+      operationId: completePasswordReset
+      summary: Set a new password
+      tags: [Accounts]
+      security: []
+      parameters:
+        - name: token
+          in: path
+          required: true
+          schema: {type: string}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [password]
+              properties:
+                password: {type: string, format: password, minLength: 8}
+      responses:
+        "204":
+          description: Password changed; the token is spent
+        "410":
+          description: Token invalid, expired, or already used
+          content:
+            application/problem+json:
+              schema: {$ref: "#/components/schemas/Problem"}
+        "422":
+          $ref: "#/components/responses/Unprocessable"
+
+  /email-changes:
+    post:
+      operationId: requestEmailChange
+      summary: Start an email change
+      description: |
+        Sends two confirmation links — one to the current address, one to the new
+        one. The address changes only when both are opened, so a stolen session
+        cannot redirect the account's mail.
+      tags: [Accounts]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email]
+              properties:
+                email: {type: string, format: email}
+      responses:
+        "202":
+          description: Both confirmations sent
+        "409":
+          description: A change is already pending
+          content:
+            application/problem+json:
+              schema: {$ref: "#/components/schemas/Problem"}
+
+  /email-changes/confirmations:
+    post:
+      operationId: confirmEmailChange
+      summary: Redeem one confirmation link
+      tags: [Accounts]
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [token]
+              properties:
+                token: {type: string}
+      responses:
+        "200":
+          description: Recorded; `applied` says whether both halves are now in
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  applied: {type: boolean}
+        "410":
+          description: Token invalid, expired, or already used
+          content:
+            application/problem+json:
+              schema: {$ref: "#/components/schemas/Problem"}
+
+  /users/me:
+    get:
+      operationId: getMe
+      summary: Own profile
+      tags: [Directory]
+      responses:
+        "200":
+          description: Profile
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Account"}
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+    patch:
+      operationId: updateMe
+      summary: Update own profile
+      description: |
+        Changing `email` does not change the address: it starts the double
+        confirmation and returns 202.
+      tags: [Directory]
+      requestBody:
+        required: true
+        content:
+          application/merge-patch+json:
+            schema:
+              type: object
+              properties:
+                full_name: {type: string}
+                maidenhead: {type: string}
+                qth: {type: string}
+                rig: {type: string}
+                language: {type: string, enum: [en, de, es, fr]}
+                enable_aprs: {type: boolean}
+                email: {type: string, format: email}
+                new_password: {type: string, format: password, minLength: 8}
+      responses:
+        "200":
+          description: Updated
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Account"}
+        "202":
+          description: Email change started; confirmations sent
+        "422":
+          $ref: "#/components/responses/Unprocessable"
+
+  /directory:
+    get:
+      operationId: listDirectory
+      summary: Station directory
+      description: Public fields only. Email, password hash and timestamps are not in this shape.
+      tags: [Directory]
+      parameters:
+        - $ref: "#/components/parameters/Cursor"
+        - $ref: "#/components/parameters/Limit"
+        - name: q
+          in: query
+          description: Callsign prefix
+          schema: {type: string}
+      responses:
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "200":
+          description: Stations
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items: {$ref: "#/components/schemas/Station"}
+                  next_cursor: {type: [string, "null"]}
+                  has_more: {type: boolean}
+
+  /users:
+    get:
+      operationId: listUsers
+      summary: User list (sysop)
+      tags: [Sysop]
+      parameters:
+        - $ref: "#/components/parameters/Cursor"
+        - $ref: "#/components/parameters/Limit"
+      responses:
+        "200":
+          description: Users
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items: {$ref: "#/components/schemas/Account"}
+        "403":
+          $ref: "#/components/responses/Forbidden"
+
+  /users/{callsign}:
+    patch:
+      operationId: updateUser
+      summary: Set role or disabled state (sysop)
+      description: |
+        The last enabled sysop cannot be demoted or disabled: the domain call
+        refuses it, so the BBS can never lock itself out.
+      tags: [Sysop]
+      parameters:
+        - $ref: "#/components/parameters/Callsign"
+      requestBody:
+        required: true
+        content:
+          application/merge-patch+json:
+            schema:
+              type: object
+              properties:
+                is_sysop: {type: boolean}
+                disabled: {type: boolean}
+      responses:
+        "200":
+          description: Updated
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Account"}
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "409":
+          description: Refused — this is the last enabled sysop
+          content:
+            application/problem+json:
+              schema: {$ref: "#/components/schemas/Problem"}
+
+  /boards:
+    get:
+      operationId: listBoards
+      summary: Boards
+      tags: [Boards]
+      responses:
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "200":
+          description: Boards
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items: {$ref: "#/components/schemas/Board"}
+    post:
+      operationId: createBoard
+      summary: Add a board (sysop)
+      tags: [Boards]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name]
+              properties:
+                name: {type: string}
+                description: {type: string}
+      responses:
+        "201":
+          description: Created
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Board"}
+        "409":
+          description: A board with that name exists
+          content:
+            application/problem+json:
+              schema: {$ref: "#/components/schemas/Problem"}
+
+  /boards/{board}:
+    parameters:
+      - name: board
+        in: path
+        required: true
+        schema: {type: string}
+        description: Board id, as returned by /boards.
+    get:
+      operationId: getBoard
+      summary: One board
+      tags: [Boards]
+      responses:
+        "200":
+          description: Board
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Board"}
+        "404":
+          $ref: "#/components/responses/NotFound"
+    patch:
+      operationId: updateBoard
+      summary: Rename or describe (sysop)
+      tags: [Boards]
+      requestBody:
+        required: true
+        content:
+          application/merge-patch+json:
+            schema:
+              type: object
+              properties:
+                name: {type: string}
+                description: {type: string}
+      responses:
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "200":
+          description: Updated
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Board"}
+    delete:
+      operationId: deleteBoard
+      summary: Delete a board and its messages (sysop)
+      tags: [Boards]
+      responses:
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "204":
+          description: Deleted
+
+  /boards/{board}/messages:
+    parameters:
+      - name: board
+        in: path
+        required: true
+        schema: {type: string}
+    get:
+      operationId: listMessages
+      summary: Messages in a board
+      description: |
+        `view=tree` returns nested replies, mirroring what the terminal and the
+        web UI show. `view=flat` returns rows with `parent_id` and `depth` for
+        clients that render their own tree.
+      tags: [Boards]
+      parameters:
+        - name: view
+          in: query
+          schema: {type: string, enum: [tree, flat], default: tree}
+        - $ref: "#/components/parameters/Limit"
+        - $ref: "#/components/parameters/Cursor"
+      responses:
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "200":
+          description: Messages
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items: {$ref: "#/components/schemas/Message"}
+                  next_cursor: {type: [string, "null"]}
+    post:
+      operationId: postMessage
+      summary: Post to a board
+      tags: [Boards]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [subject, body]
+              properties:
+                subject: {type: string}
+                body: {type: string}
+      responses:
+        "201":
+          description: Posted
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Message"}
+        "422":
+          $ref: "#/components/responses/Unprocessable"
+
+  /messages/{id}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: {type: string}
+    get:
+      operationId: getMessage
+      summary: One message
+      tags: [Boards]
+      responses:
+        "200":
+          description: Message
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Message"}
+        "404":
+          $ref: "#/components/responses/NotFound"
+    patch:
+      operationId: editMessage
+      summary: Edit subject and body (sysop)
+      tags: [Sysop]
+      parameters:
+        - $ref: "#/components/parameters/IfMatch"
+      requestBody:
+        required: true
+        content:
+          application/merge-patch+json:
+            schema:
+              type: object
+              properties:
+                subject: {type: string}
+                body: {type: string}
+      responses:
+        "200":
+          description: Edited
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Message"}
+        "412":
+          description: Changed underneath the edit
+    delete:
+      operationId: deleteMessage
+      summary: Delete a message and its replies (sysop)
+      tags: [Sysop]
+      responses:
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "204":
+          description: Deleted
+
+  /messages/{id}/replies:
+    post:
+      operationId: replyToMessage
+      summary: Reply to a message
+      description: |
+        Refused with 422 `reply_too_deep` past five levels below a root, and
+        nothing is written. The terminal enforces the same cap against the same
+        rows.
+      tags: [Boards]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: {type: string}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [subject, body]
+              properties:
+                subject: {type: string}
+                body: {type: string}
+      responses:
+        "201":
+          description: Posted
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Message"}
+        "422":
+          description: Refused by a rule
+          content:
+            application/problem+json:
+              schema: {$ref: "#/components/schemas/Problem"}
+              examples:
+                tooDeep:
+                  value:
+                    type: https://bbs.ea7klk.es/problems/reply-too-deep
+                    title: Thread nesting exceeds 5 levels
+                    status: 422
+                    code: reply_too_deep
+
+  /bulletins:
+    get:
+      operationId: listBulletins
+      summary: Local bulletins, newest first
+      tags: [Bulletins]
+      parameters:
+        - $ref: "#/components/parameters/Limit"
+        - $ref: "#/components/parameters/Cursor"
+      responses:
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "200":
+          description: Bulletins
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items: {$ref: "#/components/schemas/Bulletin"}
+    post:
+      operationId: createBulletin
+      summary: Add a bulletin (sysop)
+      tags: [Bulletins]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [title, body]
+              properties:
+                title: {type: string}
+                body: {type: string}
+      responses:
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "201":
+          description: Created
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Bulletin"}
+
+  /bulletins/{id}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: {type: string}
+    get:
+      operationId: getBulletin
+      summary: One bulletin
+      tags: [Bulletins]
+      responses:
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "200":
+          description: Bulletin
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Bulletin"}
+    patch:
+      operationId: updateBulletin
+      summary: Edit a bulletin (sysop)
+      tags: [Bulletins]
+      requestBody:
+        required: true
+        content:
+          application/merge-patch+json:
+            schema:
+              type: object
+              properties:
+                title: {type: string}
+                body: {type: string}
+      responses:
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "200":
+          description: Updated
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Bulletin"}
+    delete:
+      operationId: deleteBulletin
+      summary: Delete a bulletin (sysop)
+      tags: [Bulletins]
+      responses:
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "204":
+          description: Deleted
+
+  /aprs/settings:
+    get:
+      operationId: getAprsSettings
+      summary: APRS settings for this account
+      tags: [APRS]
+      responses:
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "200":
+          description: Settings
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  enable_aprs: {type: boolean}
+                  transmit_ssid:
+                    type: string
+                    description: |
+                      Always `<callsign>-0`. This station does not transmit from
+                      any other SSID, whatever the addressee.
+                    examples: [EA7KLK-0]
+    patch:
+      operationId: updateAprsSettings
+      summary: Enable or disable APRS for this account
+      tags: [APRS]
+      requestBody:
+        required: true
+        content:
+          application/merge-patch+json:
+            schema:
+              type: object
+              required: [enable_aprs]
+              properties:
+                enable_aprs: {type: boolean}
+      responses:
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "200":
+          description: Updated
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  enable_aprs: {type: boolean}
+
+  /aprs/messages:
+    get:
+      operationId: listAprsMessages
+      summary: APRS history
+      parameters:
+        - name: direction
+          in: query
+          required: true
+          schema: {type: string, enum: [sent, received]}
+        - name: section
+          in: query
+          description: |
+            Bot traffic is separated from ordinary traffic. The classifier is the
+            shared one: a group tag in the body decides, then the peer.
+          schema:
+            type: string
+            enum: [direct, aprsph, thursday, groups]
+            default: direct
+        - $ref: "#/components/parameters/Limit"
+        - $ref: "#/components/parameters/Cursor"
+      tags: [APRS]
+      responses:
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "200":
+          description: Messages
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items: {$ref: "#/components/schemas/AprsMessage"}
+                  next_cursor: {type: [string, "null"]}
+                  totals:
+                    type: object
+                    description: Per-section totals, for the section tabs.
+                    additionalProperties: {type: integer}
+    post:
+      operationId: sendAprsMessage
+      summary: Send an APRS message
+      description: |
+        Splits at 67 characters into numbered parts and transmits them.
+
+        `Idempotency-Key` is **required**: a retried send is a second packet on the
+        air, visible to the recipient, and this is not recoverable after the fact.
+        A repeat with the same key returns the original response.
+
+        Returns 201 with the result of the transmission, not 202: the BBS
+        transmits during the request, so which parts succeeded is known.
+      tags: [APRS]
+      parameters:
+        - name: Idempotency-Key
+          in: header
+          required: true
+          schema: {type: string, format: uuid}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [destination, text]
+              properties:
+                destination:
+                  type: string
+                  description: Callsign with optional SSID, e.g. EA7KLK-15.
+                  examples: [EA7KLK-15]
+                text: {type: string, maxLength: 2000}
+      responses:
+        "201":
+          description: Transmitted
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/AprsMessage"}
+        "409":
+          description: APRS is disabled for this account
+          content:
+            application/problem+json:
+              schema: {$ref: "#/components/schemas/Problem"}
+        "422":
+          $ref: "#/components/responses/Unprocessable"
+        "502":
+          description: APRS-IS unreachable or refused the packet
+          content:
+            application/problem+json:
+              schema: {$ref: "#/components/schemas/Problem"}
+
+  /aprs/messages/{id}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: {type: string}
+    get:
+      operationId: getAprsMessage
+      summary: One APRS message, with its parts
+      tags: [APRS]
+      responses:
+        "200":
+          description: Message
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/AprsMessage"}
+        "404":
+          $ref: "#/components/responses/NotFound"
+    delete:
+      operationId: deleteAprsMessage
+      summary: Delete one of your own APRS messages
+      tags: [APRS]
+      responses:
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "204":
+          description: Deleted
+
+  /aprs/bots/aprsph/commands:
+    post:
+      operationId: sendAprsphCommand
+      summary: Send an APRSPH command
+      description: |
+        The command string is built from structured input, because the strings are
+        a wire format: `LAST10 THURS`, `MINE10 EA7KLK`, `?APRSM`. A client that
+        assembled them by hand would eventually send `MINE10 THURS EA7KLK`, which
+        the bot reads as a callsign of "THURS".
+
+        Commands are never split across messages. A command that does not fit in
+        one is refused.
+      tags: [APRS]
+      parameters:
+        - name: Idempotency-Key
+          in: header
+          required: true
+          schema: {type: string, format: uuid}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              oneOf:
+                - $ref: "#/components/schemas/AprsphCommand"
+                - type: object
+                  required: [command]
+                  properties:
+                    command:
+                      type: string
+                      description: Free-form command, for escape hatches. Never split.
+                      maxLength: 61
+      responses:
+        "201":
+          description: Transmitted
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/AprsMessage"}
+        "422":
+          $ref: "#/components/responses/Unprocessable"
+
+  /aprs/thursday/join:
+    post:
+      operationId: joinThursday
+      summary: Check in to #APRSThursday
+      description: |
+        Sends `CQ HOTG <message>` to ANSRVR. The message is required: the group
+        server ignores a bare command, and a join without text is a packet nobody
+        acts on.
+
+        Only on Thursdays, 0000Z–2359Z; otherwise 409. That is the group's own
+        rule, and traffic outside it is noise for everyone subscribed.
+      tags: [APRS]
+      parameters:
+        - name: Idempotency-Key
+          in: header
+          required: true
+          schema: {type: string, format: uuid}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [message]
+              properties:
+                message: {type: string, maxLength: 40}
+      responses:
+        "201":
+          description: Joined
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/AprsMessage"}
+        "409":
+          description: Not Thursday, or APRS disabled
+          content:
+            application/problem+json:
+              schema: {$ref: "#/components/schemas/Problem"}
+
+  /aprs/thursday/leave:
+    post:
+      operationId: leaveThursday
+      summary: Leave #APRSThursday
+      description: |
+        Sends `U HOTG`. Allowed on any day — participants are asked to leave when
+        they stop, so their local network is not kept busy — but requires an
+        explicit confirmation.
+      tags: [APRS]
+      parameters:
+        - name: Idempotency-Key
+          in: header
+          required: true
+          schema: {type: string, format: uuid}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [confirm]
+              properties:
+                confirm: {type: boolean, const: true}
+      responses:
+        "201":
+          description: Left
+        "422":
+          description: Confirmation missing
+          content:
+            application/problem+json:
+              schema: {$ref: "#/components/schemas/Problem"}
+
+  /aprs/thursday/keepalive:
+    post:
+      operationId: keepaliveThursday
+      summary: Extend the subscription
+      description: Sends `K HOTG`.
+      tags: [APRS]
+      parameters:
+        - name: Idempotency-Key
+          in: header
+          required: true
+          schema: {type: string, format: uuid}
+      responses:
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "201":
+          description: Extended
+
+  /aprs/bulletins:
+    get:
+      operationId: listAprsBulletins
+      summary: Bulletins received over APRS
+      description: |
+        Read-only: the receiver owns this table and its ten-day window, measured
+        from the last time each bulletin was heard. Categories with nothing in
+        them are omitted.
+      tags: [APRSBulletins]
+      parameters:
+        - name: category
+          in: query
+          schema:
+            type: string
+            enum:
+              [weather, emergency, traffic, nets, events, dx, satellite, network,
+               service, organisation, test, general, other]
+      responses:
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "200":
+          description: Bulletins, or category counts when no category is given
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items: {$ref: "#/components/schemas/AprsBulletin"}
+
+  /aprs/bulletins/{id}:
+    get:
+      operationId: getAprsBulletin
+      summary: One APRS bulletin
+      tags: [APRSBulletins]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: {type: string}
+      responses:
+        "200":
+          description: Bulletin
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/AprsBulletin"}
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: opaque
+      description: |
+        A session token from `POST /v1/sessions`, or an API key with scopes
+        `bbs.read`, `bbs.write`, `bbs.admin`.
+
+  parameters:
+    Cursor:
+      name: cursor
+      in: query
+      description: Opaque cursor from a previous response.
+      schema: {type: string}
+    Limit:
+      name: limit
+      in: query
+      schema: {type: integer, minimum: 1, maximum: 200, default: 25}
+    Callsign:
+      name: callsign
+      in: path
+      required: true
+      schema: {type: string}
+    IfMatch:
+      name: If-Match
+      in: header
+      description: ETag from the read. 412 when the row changed.
+      schema: {type: string}
+
+  responses:
+    Unauthorized:
+      description: Missing, unknown, or expired credential
+      content:
+        application/problem+json:
+          schema: {$ref: "#/components/schemas/Problem"}
+    Forbidden:
+      description: Authenticated but not permitted
+      content:
+        application/problem+json:
+          schema: {$ref: "#/components/schemas/Problem"}
+    NotFound:
+      description: Absent, or invisible to this principal
+      content:
+        application/problem+json:
+          schema: {$ref: "#/components/schemas/Problem"}
+    Unprocessable:
+      description: Well-formed but refused by a rule
+      content:
+        application/problem+json:
+          schema: {$ref: "#/components/schemas/Problem"}
+    RateLimited:
+      description: Rate limited
+      headers:
+        Retry-After:
+          schema: {type: integer}
+          description: Seconds to wait.
+        RateLimit-Remaining:
+          schema: {type: integer}
+      content:
+        application/problem+json:
+          schema: {$ref: "#/components/schemas/Problem"}
+
+  schemas:
+    Problem:
+      type: object
+      description: RFC 9457 problem detail.
+      required: [type, title, status]
+      properties:
+        type: {type: string, format: uri}
+        title: {type: string}
+        status: {type: integer}
+        detail: {type: string}
+        instance: {type: string}
+        code:
+          type: string
+          description: Stable machine-readable discriminator. Branch on this, not on title.
+          examples: [reply_too_deep]
+        errors:
+          type: array
+          items:
+            type: object
+            properties:
+              field: {type: string}
+              reason: {type: string}
+
+    Session:
+      type: object
+      properties:
+        token:
+          type: string
+          description: Returned once, at login. Only its hash is stored.
+        expires_at: {type: string, format: date-time}
+        user: {$ref: "#/components/schemas/Account"}
+
+    Account:
+      type: object
+      description: |
+        The full account, returned only to its owner or to a sysop. The public
+        stations list uses `Station` instead, which cannot leak these fields.
+      properties:
+        callsign: {type: string}
+        full_name: {type: string}
+        email: {type: string, format: email}
+        maidenhead: {type: string}
+        qth: {type: string}
+        rig: {type: string}
+        language: {type: string, enum: [en, de, es, fr]}
+        enable_aprs: {type: boolean}
+        is_sysop: {type: boolean}
+        disabled: {type: boolean}
+        activated: {type: boolean}
+        registered_at:
+          type: string
+          format: date-time
+          description: Write-once; the date the account was created.
+
+    Station:
+      type: object
+      description: Public directory entry. No email, hash, or timestamps.
+      properties:
+        callsign: {type: string}
+        full_name: {type: string}
+        maidenhead: {type: string}
+        qth: {type: string}
+        rig: {type: string}
+        enable_aprs: {type: boolean}
+
+    Board:
+      type: object
+      properties:
+        id: {type: string}
+        name: {type: string}
+        description: {type: string}
+        message_count: {type: integer}
+        created_at: {type: string, format: date-time}
+
+    Message:
+      type: object
+      properties:
+        id: {type: string}
+        board_id: {type: string}
+        parent_id: {type: [string, "null"]}
+        depth:
+          type: integer
+          description: 0 for a top-level message, at most 5.
+        from: {type: string}
+        subject: {type: string}
+        body: {type: string}
+        created_at: {type: string, format: date-time}
+        edited_at: {type: [string, "null"], format: date-time}
+        replies:
+          type: array
+          description: Present when `view=tree`.
+          items: {$ref: "#/components/schemas/Message"}
+
+    Bulletin:
+      type: object
+      properties:
+        id: {type: string}
+        title: {type: string}
+        body: {type: string}
+        from: {type: string}
+        updated_at: {type: string, format: date-time}
+
+    AprsMessage:
+      type: object
+      properties:
+        id: {type: string}
+        direction: {type: string, enum: [sent, received]}
+        section:
+          type: string
+          enum: [direct, aprsph, thursday, groups]
+        at: {type: string, format: date-time}
+        from: {type: string}
+        to: {type: string}
+        text: {type: string}
+        status:
+          type: string
+          description: Aggregate across parts.
+          enum: [sent, failed]
+        acked: {type: boolean}
+        parts:
+          type: array
+          items:
+            type: object
+            properties:
+              number: {type: integer}
+              text: {type: string}
+              status: {type: string, enum: [sent, failed]}
+              detail: {type: string}
+              message_id: {type: string}
+              acked: {type: boolean}
+        raw:
+          type: string
+          description: The packet as received, for received messages.
+
+    AprsphCommand:
+      type: object
+      required: [command]
+      properties:
+        command:
+          type: string
+          enum: [checkin, quiet, list, last, mine, search, inbox, path, position, status, checkout, help]
+        count: {type: string, enum: ["5", "10", "15"], default: "5"}
+        target: {type: string, description: "Callsign for mine or inbox"}
+        phrase: {type: string, description: "Text for checkin, quiet, or the query for search"}
+        thursday: {type: boolean, description: "Restrict last and mine to the #APRSThursday log"}
+
+    AprsBulletin:
+      type: object
+      properties:
+        id: {type: string}
+        category: {type: string}
+        group: {type: string}
+        slot: {type: integer}
+        from: {type: string}
+        text: {type: string}
+        first_seen: {type: string, format: date-time}
+        last_seen: {type: string, format: date-time}
+        seen_count: {type: integer}
+        raw: {type: string}

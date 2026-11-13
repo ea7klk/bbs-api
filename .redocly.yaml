@@ -1,0 +1,30 @@
+extends:
+  - recommended
+
+# These are the rules that matter for a contract other people generate clients
+# from. Everything else stays at the recommended default.
+rules:
+  # A docs UI entry without these is a bare path in a list.
+  operation-operationId: error
+  operation-summary: error
+  operation-operationId-unique: error
+
+  # Every tag an operation uses must be declared at the top level, or the docs UI
+  # groups everything under "untagged".
+  operation-tag-defined: error
+
+  # One error shape, not one per handler. The three operations that genuinely
+  # cannot fail with a 4XX — liveness, readiness, version — are recorded in
+  # .redocly.lint-ignore.yaml rather than weakening the rule for everything.
+  operation-4xx-response: error
+
+  # A dangling $ref breaks the docs UI silently: it renders, and it is wrong.
+  no-unresolved-refs: error
+
+  # Servers are declared explicitly; there is no sensible default host.
+  no-empty-servers: error
+
+  # Descriptions are written where behaviour is surprising — the APRS sends, the
+  # Thursday gate, the depth cap — and omitted where the summary says it. One per
+  # operation produces "Gets the boards." and teaches readers to skip them.
+  operation-description: off

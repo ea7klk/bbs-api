@@ -1,0 +1,18 @@
+# Binary and build output
+/bbs-api
+/cmd/bbs-api/bbs-api
+/dist/
+
+# Frontend dependencies and build
+node_modules/
+/web/dist/
+
+# Local configuration
+.env
+*.local
+
+# Editors and OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
